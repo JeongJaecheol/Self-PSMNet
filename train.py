@@ -15,11 +15,11 @@ import torch.optim as optim
 import torch.utils.data
 from torch.autograd import Variable
 import torch.nn.functional as F
+import torchvision.utils
+from tensorboardX import SummaryWriter
 
-from dataloader import listflowfile as lt
-#from dataloader import listburyfile as lt
-from dataloader import SceneFlowLoader as DA
-#from dataloader import MiddleburyLoader as DA
+from dataloader import listflowfile as lt    #from dataloader import listburyfile as lt
+from dataloader import SceneFlowLoader as DA #from dataloader import MiddleburyLoader as DA
 from utils import pfm_IO
 from utils.demo import *
 from models import *
@@ -27,7 +27,7 @@ from models import *
 parser = argparse.ArgumentParser(description='PSMNet')
 parser.add_argument('--maxdisp', type=int ,default=192,
                     help='maxium disparity')
-parser.add_argument('--model', default='stackhourglass',
+parser.add_argument('--model', default='stackhourglass_3d_share', # stackhourglass
                     help='select model')
 parser.add_argument('--datapath', default='../Depth-Estimation/data/Scene Flow Datasets/', # ../Depth-Estimation/data/Middlebury Datasets/
                     help='datapath')
@@ -69,8 +69,6 @@ if args.model == 'stackhourglass':
     model = stackhourglass(args.maxdisp)
 elif args.model == 'stackhourglass_self':
     model = stackhourglass_self(args.maxdisp)
-elif args.model == 'stackhourglass_3d_share':
-    model = stackhourglass_3d_share(args.maxdisp)
 else:
     print('no model')
 
@@ -87,95 +85,108 @@ print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in mo
 
 optimizer = optim.Adam(model.parameters(), lr=0.001, betas=(0.9, 0.999))
 
-def train(imgL, imgR, disp_L, disp_R):
-        model.train()
-        imgL   = Variable(torch.FloatTensor(imgL))
-        imgR   = Variable(torch.FloatTensor(imgR))   
-        dispL_true = Variable(torch.FloatTensor(disp_L))
-        dispR_true = Variable(torch.FloatTensor(disp_R))
-        #if np.array_equal(dispL_true.numpy(), dispR_true.numpy()):
-        #    print('same')
-        #else:
-        #    print('different')
+def train(imgL, imgR, disp_L, disp_R, t_iter = None, writer = None):
+    model.train()
+    imgL   = Variable(torch.FloatTensor(imgL))
+    imgR   = Variable(torch.FloatTensor(imgR))   
+    dispL_true = Variable(torch.FloatTensor(disp_L))
+    dispR_true = Variable(torch.FloatTensor(disp_R))
+    #if np.array_equal(dispL_true.numpy(), dispR_true.numpy()):
+    #    print('same')
+    #else:
+    #    print('different')
 
-        if args.cuda:
-            imgL, imgR = imgL.cuda(), imgR.cuda()
-            dispL_true, dispR_true = dispL_true.cuda(), dispR_true.cuda()
+    if args.cuda:
+        imgL, imgR = imgL.cuda(), imgR.cuda()
+        dispL_true, dispR_true = dispL_true.cuda(), dispR_true.cuda()
 
-       #---------
-        maskL = dispL_true < args.maxdisp
-        maskL.detach_()
-        maskR = dispR_true < args.maxdisp
-        maskR.detach_()
-        #----
-        optimizer.zero_grad()
+    #---------
+    maskL = dispL_true < args.maxdisp
+    maskL.detach_()
+    maskR = dispR_true < args.maxdisp
+    maskR.detach_()
+    #----
+    optimizer.zero_grad()
         
+    if args.model == 'basic':
+        output3 = model(imgL,imgR)
+        output = torch.squeeze(output3,1)
+        loss = F.smooth_l1_loss(output3[maskL], dispL_true[maskL], size_average=True)
+    elif args.model == 'stackhourglass':
+        output1, output2, output3 = model(imgL,imgR)
+        output1 = torch.squeeze(output1,1)
+        output2 = torch.squeeze(output2,1)
+        output3 = torch.squeeze(output3,1)
+        loss_1 = F.smooth_l1_loss(output1[maskL], dispL_true[maskL], size_average=True)
+        loss_2 = F.smooth_l1_loss(output2[maskL], dispL_true[maskL], size_average=True)
+        loss_3 = F.smooth_l1_loss(output3[maskL], dispL_true[maskL], size_average=True) 
+        loss = 0.5*loss_1 + 0.7*loss_2 + loss_3
+    elif args.model == 'stackhourglass_self':
+        output, _ = model(imgL,imgR)
+        loss = F.l1_loss(output, imgR, size_average=True)
+
+    loss.backward()
+    optimizer.step()
+
+    if writer.__class__.__name__ is "SummaryWriter":
         if args.model == 'basic':
-            output3 = model(imgL,imgR)
-            output = torch.squeeze(output3,1)
-            loss = F.smooth_l1_loss(output3[maskL], dispL_true[maskL], size_average=True)
+            for name, param in model.named_parameters():
+                writer.add_histogram(name, param.clone().cpu().data.numpy(), t_iter)
+            writer.add_scalar(tag = 'loss/total_loss', scalar_value = loss.data[0], global_step = t_iter)
+            if t_iter % 1000:
+                writer.add_image('Left Input Image', torchvision.utils.make_grid(imgL, normalize=True, scale_each=True), t_iter)
+                writer.add_image('Right Input Image', torchvision.utils.make_grid(imgR, normalize=True, scale_each=True), t_iter)
+                writer.add_image('Ground Truth Left disparity map', torchvision.utils.make_grid(dispL_true, normalize=True, scale_each=True), t_iter)
+                writer.add_image('Ground Truth Right disparity map', torchvision.utils.make_grid(dispR_true, normalize=True, scale_each=True), t_iter)
+                writer.add_image('model Left disparity map', torchvision.utils.make_grid(output, normalize=True, scale_each=True), t_iter)
         elif args.model == 'stackhourglass':
-            output1, output2, output3 = model(imgL,imgR)
-            output1 = torch.squeeze(output1,1)
-            output2 = torch.squeeze(output2,1)
-            output3 = torch.squeeze(output3,1)
-
-            loss_1 = F.smooth_l1_loss(output1[maskL], dispL_true[maskL], size_average=True)
-            loss_2 = F.smooth_l1_loss(output2[maskL], dispL_true[maskL], size_average=True)
-            loss_3 = F.smooth_l1_loss(output3[maskL], dispL_true[maskL], size_average=True) 
-
-            loss = 0.5*loss_1 + 0.7*loss_2 + loss_3
+            for name, param in model.named_parameters():
+                writer.add_histogram(name, param.clone().cpu().data.numpy(), t_iter)
+            writer.add_scalar(tag = 'loss/loss_1', scalar_value = loss_1.data[0], global_step = t_iter)
+            writer.add_scalar(tag = 'loss/loss_2', scalar_value = loss_2.data[0], global_step = t_iter)
+            writer.add_scalar(tag = 'loss/loss_3', scalar_value = loss_3.data[0], global_step = t_iter)
+            writer.add_scalar(tag = 'loss/total_loss', scalar_value = loss.data[0], global_step = t_iter)
+            if t_iter % 1000:
+                writer.add_image('Left Input Image', torchvision.utils.make_grid(imgL, normalize=True, scale_each=True), t_iter)
+                writer.add_image('Right Input Image', torchvision.utils.make_grid(imgR, normalize=True, scale_each=True), t_iter)
+                writer.add_image('Ground Truth Left disparity map', torchvision.utils.make_grid(dispL_true, normalize=True, scale_each=True), t_iter)
+                writer.add_image('Ground Truth Right disparity map', torchvision.utils.make_grid(dispR_true, normalize=True, scale_each=True), t_iter)
+                writer.add_image('model Left disparity map', torchvision.utils.make_grid(output3, normalize=True, scale_each=True), t_iter)
         elif args.model == 'stackhourglass_self':
-            output, _ = model(imgL,imgR)
-            loss = F.l1_loss(output, imgR, size_average=True)
-        elif args.model == 'stackhourglass_3d_share':
-            dispL1, dispL2, dispL3, dispR1, dispR2, dispR3 = model(imgL,imgR)
-            #dispL1, dispL2, dispL3 = model(imgL,imgR)
-            #dispR1, dispR2, dispR3 = model(imgL,imgR)
-            dispL1 = torch.squeeze(dispL1,1)
-            dispL2 = torch.squeeze(dispL2,1)
-            dispL3 = torch.squeeze(dispL3,1)
-            dispR1 = torch.squeeze(dispR1,1)
-            dispR2 = torch.squeeze(dispR2,1)
-            dispR3 = torch.squeeze(dispR3,1)
-            loss_L1 = F.smooth_l1_loss(dispL1[maskL], dispL_true[maskL], size_average=True)
-            loss_L2 = F.smooth_l1_loss(dispL2[maskL], dispL_true[maskL], size_average=True)
-            loss_L3 = F.smooth_l1_loss(dispL3[maskL], dispL_true[maskL], size_average=True)
-            loss_R1 = F.smooth_l1_loss(dispR1[maskR], dispR_true[maskR], size_average=True)
-            loss_R2 = F.smooth_l1_loss(dispR2[maskR], dispR_true[maskR], size_average=True)
-            loss_R3 = F.smooth_l1_loss(dispR3[maskR], dispR_true[maskR], size_average=True)
-
-            loss = 0.25*(loss_L1 + loss_R1) + 0.35*(loss_L2 + loss_R2) + 0.5*(loss_L3 + loss_R3)
-            #loss = 0.5*loss_L1 + 0.7*loss_L2 + loss_L3
-            #loss = 0.5*loss_R1 + 0.7*loss_R2 + loss_R3
-
-        loss.backward()
-        optimizer.step()
-
+            for name, param in model.named_parameters():
+                writer.add_histogram(name, param.clone().cpu().data.numpy(), t_iter)
+            writer.add_scalar(tag = 'loss/total_loss', scalar_value = loss.data[0], global_step = t_iter)
+            if t_iter % 1000:
+                writer.add_image('Left Input Image', torchvision.utils.make_grid(imgL, normalize=True, scale_each=True), t_iter)
+                writer.add_image('Right Input Image', torchvision.utils.make_grid(imgR, normalize=True, scale_each=True), t_iter)
+                writer.add_image('Ground Truth Left disparity map', torchvision.utils.make_grid(dispL_true, normalize=True, scale_each=True), t_iter)
+                writer.add_image('Ground Truth Right disparity map', torchvision.utils.make_grid(dispR_true, normalize=True, scale_each=True), t_iter)
+                writer.add_image('model Left disparity map', torchvision.utils.make_grid(output, normalize=True, scale_each=True), t_iter)
+    else:
         return loss.data[0]
 
 def test(imgL,imgR,disp_true):
-        model.eval()
-        imgL   = Variable(torch.FloatTensor(imgL))
-        imgR   = Variable(torch.FloatTensor(imgR))  
-        if args.cuda:
-            imgL, imgR = imgL.cuda(), imgR.cuda()
+    model.eval()
+    imgL = Variable(torch.FloatTensor(imgL))
+    imgR = Variable(torch.FloatTensor(imgR))  
+    if args.cuda:
+        imgL, imgR = imgL.cuda(), imgR.cuda()
 
-        #---------
-        mask = disp_true < 192
-        #----
+    #---------
+    mask = disp_true < 192
+    #----
 
-        with torch.no_grad():
-            output3 = model(imgL,imgR)
+    with torch.no_grad():
+        output3 = model(imgL,imgR)
 
-        output = torch.squeeze(output3.data.cpu(),1)[:,4:,:]
+    output = torch.squeeze(output3.data.cpu(),1)[:,4:,:]
 
-        if len(disp_true[mask])==0:
-           loss = 0
-        else:
-           loss = torch.mean(torch.abs(output[mask]-disp_true[mask]))  # end-point-error
+    if len(disp_true[mask])==0:
+        loss = 0
+    else:
+        loss = torch.mean(torch.abs(output[mask]-disp_true[mask]))  # end-point-error
 
-        return loss
+    return loss
 
 def adjust_learning_rate(optimizer, epoch):
     lr = 0.001
@@ -184,20 +195,29 @@ def adjust_learning_rate(optimizer, epoch):
         param_group['lr'] = lr
 
 def main():
-
-	start_full_time = time.time()
-	for epoch in range(1, args.epochs+1):
+    writer = SummaryWriter(log_dir='./Tensorboard/%s/' %(args.model), comment='')
+    writer.add_graph(model = model, input_to_model=None)
+    
+    start_full_time = time.time()
+    total_iter = 0
+    batch_idx = 0
+    for epoch in range(1, args.epochs+1):
 	    print('This is %d-th epoch' %(epoch))
 	    total_train_loss = 0
 	    adjust_learning_rate(optimizer,epoch)
 	    ## training ##
 	    for batch_idx, (imgL_crop, imgR_crop, disp_crop_L, disp_crop_R) in enumerate(TrainImgLoader, 1):
 	        start_time = time.time()
-	        loss = train(imgL_crop, imgR_crop, disp_crop_L, disp_crop_R)
+	        loss = train(imgL_crop, imgR_crop, disp_crop_L, disp_crop_R, t_iter = total_iter + batch_idx, writer = writer)
 	        print('Iter %d , training loss = %.3f , time = %.2f' %(batch_idx, loss, time.time() - start_time))
-	        total_train_loss += loss         
-         
+	        total_train_loss += loss      
+        
+	    print('----------------------------------------------------------------------') 
 	    print('epoch %d total training loss = %.3f' %(epoch, total_train_loss/len(TrainImgLoader)))
+	    total_iter = total_iter + batch_idx
+	    print('1 epoch total iteration = %d' %(batch_idx))
+	    print('total training iteration = %d' %(total_iter))
+	    print('----------------------------------------------------------------------') 
 
 	    #SAVE
 	    savefilename = args.savemodel+'/non_pretrained_3d_share_ckpt_'+str(epoch)+'.tar'
@@ -207,7 +227,9 @@ def main():
                     'train_loss': total_train_loss/len(TrainImgLoader),
 		}, savefilename)
 
-	print('full training time = %.2f HR' %((time.time() - start_full_time)/3600))
+    print('full training time = %.2f HR' %((time.time() - start_full_time)/3600))
+    
+    writer.close()
 
     #------------- TEST ------------------------------------------------------------
 	#----------------------------------------------------------------------------------
@@ -222,5 +244,5 @@ def main():
 
 
 if __name__ == '__main__':
-   main()
+    main()
     
